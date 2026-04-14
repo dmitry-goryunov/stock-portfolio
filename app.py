@@ -295,17 +295,21 @@ with tab5:
     defaults    = ["ULVR.L", "AZN.L", "HSBA.L", "CASH", all_options[0], all_options[0]]
     def_weights = [0.25, 0.25, 0.25, 0.25, 0.0, 0.0]
 
+    # Seed session state once so subsequent re-runs don't reset widget values
+    for k in range(6):
+        if f"cp_t{k}" not in st.session_state:
+            st.session_state[f"cp_t{k}"] = defaults[k] if defaults[k] in all_options else all_options[0]
+        if f"cp_w{k}" not in st.session_state:
+            st.session_state[f"cp_w{k}"] = def_weights[k]
+
     cp_raw = {}
     cols_a, cols_b = st.columns(2)
     for k in range(6):
-        default_t = defaults[k]
-        default_i = all_options.index(default_t) if default_t in all_options else 0
         col = cols_a if k % 2 == 0 else cols_b
         with col:
-            t = st.selectbox(f"Asset {k+1}", options=all_options,
-                             index=default_i, key=f"cp_t{k}")
+            t = st.selectbox(f"Asset {k+1}", options=all_options, key=f"cp_t{k}")
             w = st.number_input(f"Weight {k+1}", min_value=0.0, max_value=1.0,
-                                value=def_weights[k], step=0.05, key=f"cp_w{k}")
+                                step=0.05, key=f"cp_w{k}")
             if w > 0:
                 cp_raw[t] = cp_raw.get(t, 0) + w
 
