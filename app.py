@@ -293,30 +293,34 @@ with tab5:
                "Weights are auto-normalised if they don't sum to 1.")
 
     all_options = stocks_list + ["CASH"]
+    defaults    = ["ULVR.L", "AZN.L", "HSBA.L", "CASH"]
 
-    # Editable table: ticker + weight
-    default_rows = [
-        {"Ticker": "ULVR.L", "Weight": 0.25},
-        {"Ticker": "AZN.L",  "Weight": 0.25},
-        {"Ticker": "HSBA.L", "Weight": 0.25},
-        {"Ticker": "CASH",   "Weight": 0.25},
-    ]
-    cp_editor = st.data_editor(
-        pd.DataFrame(default_rows),
-        column_config={
-            "Ticker": st.column_config.SelectboxColumn("Ticker", options=all_options, required=True),
-            "Weight": st.column_config.NumberColumn("Weight", min_value=0.0, max_value=1.0,
-                                                    step=0.05, format="%.2f"),
-        },
-        num_rows="dynamic",
-        use_container_width=True,
-        key="cp_editor",
-    )
+    ROWS = 6
+    default_weights = [0.25, 0.25, 0.25, 0.25, 0.0, 0.0]
 
-    if st.button("Analyse", type="primary"):
-        cp_raw = {row["Ticker"]: row["Weight"]
-                  for _, row in cp_editor.iterrows()
-                  if pd.notna(row["Ticker"]) and row["Weight"] > 0}
+    cp_raw = {}
+    with st.form("custom_portfolio_form"):
+        st.caption("Set weight to 0 to exclude a position.")
+        cols_a, cols_b = st.columns(2)
+        rows = []
+        for k in range(ROWS):
+            default_t = defaults[k] if k < len(defaults) else all_options[0]
+            default_i = all_options.index(default_t) if default_t in all_options else 0
+            col = cols_a if k % 2 == 0 else cols_b
+            with col:
+                t = st.selectbox(f"Asset {k+1}", options=all_options,
+                                 index=default_i, key=f"cp_t{k}")
+                w = st.number_input(f"Weight {k+1}", min_value=0.0, max_value=1.0,
+                                    value=default_weights[k], step=0.05, key=f"cp_w{k}")
+                rows.append((t, w))
+        submitted = st.form_submit_button("Analyse", type="primary", use_container_width=True)
+
+    if submitted:
+        for t, w in rows:
+            if w > 0:
+                cp_raw[t] = cp_raw.get(t, 0) + w
+
+    if submitted and cp_raw:
 
         if not cp_raw:
             st.error("Add at least one position with a positive weight.")
