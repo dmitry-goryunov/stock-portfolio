@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from scipy.optimize import minimize
 from itertools import combinations
-import pathlib, contextlib
+import pathlib, contextlib  # noqa: F401
 
 st.set_page_config(page_title="Portfolio Optimiser", layout="wide")
 st.title("Portfolio Optimisation")
@@ -42,36 +42,21 @@ with st.sidebar:
 
 @st.cache_data(show_spinner="Downloading price data...")
 def load_returns(tickers, start, end, dividends):
-    for db in pathlib.Path.home().glob("AppData/Local/py-yfinance/*.db"):
-        with contextlib.suppress(Exception):
-            db.unlink()
+    frames = {}
+    for t in tickers:
+        try:
+            h = yf.Ticker(t).history(start=start, end=end,
+                                     interval="1mo", auto_adjust=dividends)
+            if not h.empty and "Close" in h.columns:
+                frames[t] = h["Close"]
+        except Exception:
+            pass
 
-    if dividends:
-        data = yf.download(list(tickers), start=start, end=end,
-                           interval="1mo", auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            l0 = set(data.columns.get_level_values(0))
-            l1 = set(data.columns.get_level_values(1))
-            if {"Close", "Adj Close"} & l0:
-                col = "Adj Close" if "Adj Close" in l0 else "Close"
-                df = data[col].copy()
-            else:
-                col = "Adj Close" if "Adj Close" in l1 else "Close"
-                df = data.xs(col, level=1, axis=1).copy()
-        else:
-            df = data[["Close"]].copy()
-    else:
-        frames = {}
-        for t in tickers:
-            try:
-                h = yf.Ticker(t).history(start=start, end=end, interval="1mo", auto_adjust=False)
-                if not h.empty and "Close" in h.columns:
-                    frames[t] = h["Close"]
-            except Exception:
-                pass
-        df = pd.DataFrame(frames)
+    if not frames:
+        return pd.DataFrame()
 
-    df.index = pd.to_datetime(df.index).strftime("%b-%Y")
+    df = pd.DataFrame(frames)
+    df.index = pd.to_datetime(df.index).tz_localize(None).strftime("%b-%Y")
     df = df.dropna(axis=1, how="all")
     df = df.pct_change().iloc[1:]
     df = df.dropna(axis=1, how="all")
@@ -86,18 +71,18 @@ def load_div_mean(tickers, start, end):
         try:
             h = yf.Ticker(t).history(start=start, end=end, interval="1d", auto_adjust=False)
             if not h.empty and len(h) >= 5:
+                if h.index.tz is not None:
+                    h.index = h.index.tz_localize(None)
                 c = h["Close"]
                 r = (c.diff() + h["Dividends"]) / c.shift(1)
                 r = r.iloc[1:].dropna()
-                if r.index.tz is not None:
-                    r.index = pd.DatetimeIndex([ts.replace(tzinfo=None) for ts in r.index])
                 frames[t] = (1 + r).resample("ME").prod() - 1
         except Exception:
             pass
     if not frames:
         return {}
     df = pd.DataFrame(frames)
-    df.index = df.index.strftime("%b-%Y")
+    df.index = df.index.tz_localize(None).strftime("%b-%Y")
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="any")
     return df.mean().to_dict()
 
