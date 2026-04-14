@@ -1,25 +1,16 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pyomo.environ as pyo
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+from scipy.optimize import minimize
 from itertools import combinations
-import pathlib, contextlib, os, logging
-
-logging.getLogger("pyomo.core").setLevel(logging.ERROR)
+import pathlib, contextlib
 
 st.set_page_config(page_title="Portfolio Optimiser", layout="wide")
 st.title("Portfolio Optimisation")
-st.caption("Markowitz mean-variance optimisation · Pyomo + IPOPT")
-
-# ── IPOPT path ─────────────────────────────────────────────────────────────
-try:
-    import idaes
-    ipopt_exe = os.path.join(idaes.bin_directory, "ipopt.exe")
-except Exception:
-    ipopt_exe = "ipopt"
+st.caption("Markowitz mean-variance optimisation")
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -111,32 +102,35 @@ def load_div_mean(tickers, start, end):
     return df.mean().to_dict()
 
 
-def solve_portfolio(stocks_list, mean_ret, cov_dict, floor, exe):
-    m = pyo.ConcreteModel()
-    m.stocks = pyo.Set(initialize=stocks_list)
-    m.p = pyo.Var(m.stocks, domain=pyo.NonNegativeReals)
-    m.obj = pyo.Objective(
-        expr=sum(cov_dict[i, j] * m.p[i] * m.p[j] for i in m.stocks for j in m.stocks),
-        sense=pyo.minimize,
-    )
-    m.c1 = pyo.Constraint(expr=sum(m.p[i] * mean_ret[i] for i in m.stocks) >= floor)
-    m.c2 = pyo.Constraint(expr=sum(m.p[i] for i in m.stocks) == 1)
-    solver = pyo.SolverFactory("ipopt", executable=exe)
-    res = solver.solve(m, tee=False)
-    if res.solver.termination_condition == pyo.TerminationCondition.optimal:
-        return {i: pyo.value(m.p[i]) for i in m.stocks}, pyo.value(m.obj)
+def solve_portfolio(stocks_list, mean_ret_arr, cov_matrix, floor):
+    n = len(stocks_list)
+    w0 = np.ones(n) / n
+
+    def variance(w):
+        return w @ cov_matrix @ w
+
+    constraints = [
+        {"type": "eq",   "fun": lambda w: np.sum(w) - 1},
+        {"type": "ineq", "fun": lambda w: np.dot(w, mean_ret_arr) - floor},
+    ]
+    bounds = [(0, 1)] * n
+
+    res = minimize(variance, w0, method="SLSQP", bounds=bounds,
+                   constraints=constraints, options={"ftol": 1e-9, "maxiter": 1000})
+    if res.success:
+        return dict(zip(stocks_list, res.x)), float(res.fun)
     return None, None
 
 
-def compute_frontier(mean_ret, cov_dict, stocks_list, exe, n=40):
-    min_f = min(mean_ret.values()) + 1e-4
-    max_f = max(mean_ret.values()) * 0.95
+def compute_frontier(mean_ret_arr, cov_matrix, stocks_list, n=40):
+    min_f = float(np.min(mean_ret_arr)) + 1e-4
+    max_f = float(np.max(mean_ret_arr)) * 0.95
     vars_, rets_ = [], []
-    for rf in np.linspace(min_f, max_f, n):
-        w, v = solve_portfolio(stocks_list, mean_ret, cov_dict, rf, exe)
+    for floor in np.linspace(min_f, max_f, n):
+        w, v = solve_portfolio(stocks_list, mean_ret_arr, cov_matrix, floor)
         if w is not None:
             vars_.append(v)
-            rets_.append(rf)
+            rets_.append(floor)
     return vars_, rets_
 
 
@@ -156,21 +150,20 @@ if df.shape[1] == 0:
     st.error("No valid data returned. Check tickers and date range.")
     st.stop()
 
-stocks_list = df.columns.tolist()
-cov_vals    = df.cov().values
-cov_dict    = {(stocks_list[i], stocks_list[j]): cov_vals[i, j]
-               for i in range(len(stocks_list)) for j in range(len(stocks_list))}
-mean_ret    = df.mean().to_dict()
+stocks_list   = df.columns.tolist()
+cov_matrix    = df.cov().values
+mean_ret_arr  = df.mean().values
+mean_ret_dict = df.mean().to_dict()
 
 # 2. Optimise
 with st.spinner("Solving mean-variance optimisation..."):
-    weights, port_var = solve_portfolio(stocks_list, mean_ret, cov_dict, reward_floor, ipopt_exe)
+    weights, port_var = solve_portfolio(stocks_list, mean_ret_arr, cov_matrix, reward_floor)
 
 if weights is None:
     st.error("Solver failed — try lowering the reward floor or adding more assets.")
     st.stop()
 
-# 3. Dividend yields
+# 3. Dividend yields & names
 with st.spinner("Fetching dividend yields..."):
     div_yields, ticker_names = {}, {}
     for t in stocks_list:
@@ -187,7 +180,7 @@ with st.spinner("Fetching dividend yields..."):
 mean_ret_div = load_div_mean(tuple(stocks_list), start_str, end_str)
 
 exp_ret_div = (1 + sum(weights[i] * mean_ret_div.get(i, 0) for i in stocks_list)) ** 12 - 1
-exp_ret_po  = (1 + sum(weights[i] * mean_ret.get(i, 0)     for i in stocks_list)) ** 12 - 1
+exp_ret_po  = (1 + sum(weights[i] * mean_ret_dict.get(i, 0) for i in stocks_list)) ** 12 - 1
 ann_std     = (port_var ** 0.5) * (12 ** 0.5)
 sharpe_div  = (exp_ret_div - risk_free_rate) / ann_std
 sharpe_po   = (exp_ret_po  - risk_free_rate) / ann_std
@@ -209,10 +202,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ── Tab 1: Optimal Portfolio ───────────────────────────────────────────────
 with tab1:
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Return (with div)",    f"{exp_ret_div * 100:.2f}%")
-    m2.metric("Return (price only)",  f"{exp_ret_po  * 100:.2f}%")
-    m3.metric("Sharpe (with div)",    f"{sharpe_div:.2f}")
-    m4.metric("Wtd Div Yield",        f"{port_div:.2f}%")
+    m1.metric("Return (with div)",   f"{exp_ret_div * 100:.2f}%")
+    m2.metric("Return (price only)", f"{exp_ret_po  * 100:.2f}%")
+    m3.metric("Sharpe (with div)",   f"{sharpe_div:.2f}")
+    m4.metric("Wtd Div Yield",       f"{port_div:.2f}%")
 
     col_a, col_b = st.columns(2)
 
@@ -240,35 +233,32 @@ with tab1:
 
 # ── Tab 2: Efficient Frontier ──────────────────────────────────────────────
 with tab2:
-    with st.spinner("Computing efficient frontier (this takes ~1 min)..."):
-        var_div_f, ret_div_f = compute_frontier(mean_ret_div, cov_dict, stocks_list, ipopt_exe)
-        var_nd_f,  ret_nd_f  = compute_frontier(mean_ret,     cov_dict, stocks_list, ipopt_exe)
+    with st.spinner("Computing efficient frontier..."):
+        mean_div_arr = np.array([mean_ret_div.get(t, 0) for t in stocks_list])
+        var_div_f, ret_div_f = compute_frontier(mean_div_arr, cov_matrix, stocks_list)
+        var_nd_f,  ret_nd_f  = compute_frontier(mean_ret_arr, cov_matrix, stocks_list)
 
-    ann_ret_div_f = [(1 + r) ** 12 - 1 for r in ret_div_f]
-    ann_std_div_f = [v ** 0.5 * 12 ** 0.5 for v in var_div_f]
-    ann_ret_nd_f  = [(1 + r) ** 12 - 1 for r in ret_nd_f]
-    ann_std_nd_f  = [v ** 0.5 * 12 ** 0.5 for v in var_nd_f]
+    ann = lambda rets, vars_: (
+        [(1 + r) ** 12 - 1 for r in rets],
+        [v ** 0.5 * 12 ** 0.5 for v in vars_]
+    )
+    ret_d, std_d = ann(ret_div_f, var_div_f)
+    ret_n, std_n = ann(ret_nd_f,  var_nd_f)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=[x * 100 for x in ann_std_div_f], y=[y * 100 for y in ann_ret_div_f],
-        mode="lines+markers", name="With dividends", line=dict(color="steelblue")
-    ))
-    fig.add_trace(go.Scatter(
-        x=[x * 100 for x in ann_std_nd_f], y=[y * 100 for y in ann_ret_nd_f],
-        mode="lines+markers", name="Without dividends",
-        line=dict(color="tomato", dash="dash")
-    ))
-    fig.update_layout(
-        xaxis_title="Annual Std Dev (%)", yaxis_title="Expected Annual Return (%)",
-        legend=dict(x=0.02, y=0.98), margin=dict(t=30)
-    )
+    fig.add_trace(go.Scatter(x=[x * 100 for x in std_d], y=[y * 100 for y in ret_d],
+                             mode="lines+markers", name="With dividends",
+                             line=dict(color="steelblue")))
+    fig.add_trace(go.Scatter(x=[x * 100 for x in std_n], y=[y * 100 for y in ret_n],
+                             mode="lines+markers", name="Without dividends",
+                             line=dict(color="tomato", dash="dash")))
+    fig.update_layout(xaxis_title="Annual Std Dev (%)", yaxis_title="Expected Annual Return (%)",
+                      legend=dict(x=0.02, y=0.98), margin=dict(t=30))
     st.plotly_chart(fig, use_container_width=True)
 
 # ── Tab 3: Correlation Heatmap ─────────────────────────────────────────────
 with tab3:
-    corr = df.corr()
-    fig = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r",
+    fig = px.imshow(df.corr(), text_auto=".2f", color_continuous_scale="RdBu_r",
                     zmin=-1, zmax=1, aspect="auto")
     fig.update_layout(margin=dict(t=30))
     st.plotly_chart(fig, use_container_width=True)
@@ -283,7 +273,10 @@ with tab4:
         best_var3, best_combo, best_w3, feasible = float("inf"), None, None, 0
 
         for idx, combo in enumerate(combos):
-            w3, v3 = solve_portfolio(list(combo), mean_ret, cov_dict, reward_floor, ipopt_exe)
+            idx_list = [stocks_list.index(t) for t in combo]
+            sub_cov  = cov_matrix[np.ix_(idx_list, idx_list)]
+            sub_mean = mean_ret_arr[idx_list]
+            w3, v3   = solve_portfolio(list(combo), sub_mean, sub_cov, reward_floor)
             if w3 is not None:
                 feasible += 1
                 if v3 < best_var3:
@@ -299,9 +292,9 @@ with tab4:
             sharpe3 = (exp3 - risk_free_rate) / std3
 
             ca, cb, cc = st.columns(3)
-            ca.metric("Feasible combos",    f"{feasible}/{len(combos)}")
-            cb.metric("Return (with div)",  f"{exp3 * 100:.2f}%")
-            cc.metric("Sharpe",             f"{sharpe3:.2f}")
+            ca.metric("Feasible combos",   f"{feasible}/{len(combos)}")
+            cb.metric("Return (with div)", f"{exp3 * 100:.2f}%")
+            cc.metric("Sharpe",            f"{sharpe3:.2f}")
 
             w3_df = pd.DataFrame.from_dict(best_w3, orient="index", columns=["Weight"])
             w3_df["Weight %"] = (w3_df["Weight"] * 100).round(2)
@@ -312,9 +305,9 @@ with tab4:
 with tab5:
     st.subheader("Custom Portfolio Analyser")
 
-    n_assets = st.number_input("Number of positions", min_value=1, max_value=10, value=4)
+    n_assets    = st.number_input("Number of positions", min_value=1, max_value=10, value=4)
     all_options = stocks_list + ["CASH"]
-    cp_input = {}
+    cp_input    = {}
 
     cols = st.columns(2)
     for k in range(int(n_assets)):
@@ -331,23 +324,20 @@ with tab5:
         if total_w <= 0:
             st.error("All weights are zero.")
         else:
-            cp = {t: w / total_w for t, w in cp_input.items() if w > 0}
-            CASH_KEY   = "CASH"
+            cp         = {t: w / total_w for t, w in cp_input.items() if w > 0}
             rf_monthly = (1 + risk_free_rate) ** (1 / 12) - 1
-            risky      = [t for t in cp if t != CASH_KEY]
+            risky      = [t for t in cp if t != "CASH"]
 
             cp_mean_div = {t: mean_ret_div.get(t, 0) for t in risky}
-            cp_mean_div[CASH_KEY] = rf_monthly
-            cp_mean_po  = {t: mean_ret.get(t, 0) for t in risky}
-            cp_mean_po[CASH_KEY]  = rf_monthly
+            cp_mean_div["CASH"] = rf_monthly
+            cp_mean_po  = {t: mean_ret_dict.get(t, 0) for t in risky}
+            cp_mean_po["CASH"]  = rf_monthly
 
             risky_in_df = [t for t in risky if t in df.columns]
             if risky_in_df:
-                cp_cov      = df[risky_in_df].cov()
-                port_var_cp = sum(
-                    cp.get(i, 0) * cp.get(j, 0) * cp_cov.loc[i, j]
-                    for i in risky_in_df for j in risky_in_df
-                )
+                cp_cov      = df[risky_in_df].cov().values
+                cp_w_arr    = np.array([cp.get(t, 0) for t in risky_in_df])
+                port_var_cp = float(cp_w_arr @ cp_cov @ cp_w_arr)
             else:
                 port_var_cp = 0.0
 
@@ -360,4 +350,4 @@ with tab5:
             ca.metric("Return (with div)",   f"{exp_div_cp * 100:.2f}%")
             cb.metric("Return (price only)", f"{exp_po_cp  * 100:.2f}%")
             cc.metric("Annual Std Dev",      f"{ann_std_cp * 100:.2f}%")
-            cd.metric("Sharpe",              f"{sharpe_cp:.2f}" if not np.isnan(sharpe_cp) else "N/A")
+            cd.metric("Sharpe", f"{sharpe_cp:.2f}" if not np.isnan(sharpe_cp) else "N/A")
