@@ -286,38 +286,56 @@ with tab4:
             w3_df.index = [ticker_names.get(t, t) for t in w3_df.index]
             st.dataframe(w3_df[["Weight %"]], use_container_width=True)
 
-# ── Tab 5: Custom Portfolio ────────────────────────────────────────────────
+# ── Tab 5: Custom Portfolio Analyser (Section 10) ─────────────────────────
 with tab5:
     st.subheader("Custom Portfolio Analyser")
+    st.caption("Define any mix of assets (including CASH as a risk-free bond position). "
+               "Weights are auto-normalised if they don't sum to 1.")
 
-    n_assets    = st.number_input("Number of positions", min_value=1, max_value=10, value=4)
     all_options = stocks_list + ["CASH"]
-    cp_input    = {}
 
-    cols = st.columns(2)
-    for k in range(int(n_assets)):
-        with cols[k % 2]:
-            default_idx = min(k, len(all_options) - 1)
-            t = st.selectbox(f"Asset {k+1}", options=all_options,
-                             index=default_idx, key=f"cp_t{k}")
-            w = st.number_input(f"Weight {k+1}", min_value=0.0, max_value=1.0,
-                                value=round(1 / int(n_assets), 2), key=f"cp_w{k}")
-            cp_input[t] = cp_input.get(t, 0) + w
+    # Editable table: ticker + weight
+    default_rows = [
+        {"Ticker": "ULVR.L", "Weight": 0.25},
+        {"Ticker": "AZN.L",  "Weight": 0.25},
+        {"Ticker": "HSBA.L", "Weight": 0.25},
+        {"Ticker": "CASH",   "Weight": 0.25},
+    ]
+    cp_editor = st.data_editor(
+        pd.DataFrame(default_rows),
+        column_config={
+            "Ticker": st.column_config.SelectboxColumn("Ticker", options=all_options, required=True),
+            "Weight": st.column_config.NumberColumn("Weight", min_value=0.0, max_value=1.0,
+                                                    step=0.05, format="%.2f"),
+        },
+        num_rows="dynamic",
+        use_container_width=True,
+        key="cp_editor",
+    )
 
-    if st.button("Analyse", type="secondary"):
-        total_w = sum(cp_input.values())
-        if total_w <= 0:
-            st.error("All weights are zero.")
+    if st.button("Analyse", type="primary"):
+        cp_raw = {row["Ticker"]: row["Weight"]
+                  for _, row in cp_editor.iterrows()
+                  if pd.notna(row["Ticker"]) and row["Weight"] > 0}
+
+        if not cp_raw:
+            st.error("Add at least one position with a positive weight.")
         else:
-            cp         = {t: w / total_w for t, w in cp_input.items() if w > 0}
+            total_w = sum(cp_raw.values())
+            if abs(total_w - 1.0) > 1e-6:
+                st.info(f"Weights summed to {total_w:.4f} — normalised to 1.0.")
+            cp = {t: w / total_w for t, w in cp_raw.items()}
+
             rf_monthly = (1 + risk_free_rate) ** (1 / 12) - 1
             risky      = [t for t in cp if t != "CASH"]
 
+            # Per-ticker mean returns (with div & price-only)
             cp_mean_div = {t: mean_ret_div.get(t, 0) for t in risky}
             cp_mean_div["CASH"] = rf_monthly
             cp_mean_po  = {t: mean_ret_dict.get(t, 0) for t in risky}
             cp_mean_po["CASH"]  = rf_monthly
 
+            # Portfolio variance (risky assets only; CASH has zero variance)
             risky_in_df = [t for t in risky if t in df.columns]
             if risky_in_df:
                 cp_cov      = df[risky_in_df].cov().values
@@ -331,8 +349,48 @@ with tab5:
             ann_std_cp = (port_var_cp ** 0.5) * (12 ** 0.5) if port_var_cp > 0 else 0.0
             sharpe_cp  = (exp_div_cp - risk_free_rate) / ann_std_cp if ann_std_cp > 0 else float("nan")
 
+            # Fetch company names & dividend yields for display
+            cp_names, cp_divs = {}, {}
+            for t in cp:
+                if t == "CASH":
+                    cp_names[t] = f"Risk-Free Bond ({risk_free_rate*100:.1f}%)"
+                    cp_divs[t]  = 0.0
+                else:
+                    cp_names[t] = ticker_names.get(t, t)
+                    cp_divs[t]  = div_yields.get(t, 0.0)
+
+            # Results table (matches notebook Section 10 output)
+            res_df = pd.DataFrame({
+                "Company":     {t: cp_names[t] for t in cp},
+                "Weight %":    {t: round(cp[t] * 100, 2) for t in cp},
+                "Div Yield %": {t: round(cp_divs[t], 2) for t in cp},
+            })
+            res_df["Wtd Div %"] = (res_df["Weight %"] / 100 * res_df["Div Yield %"]).round(3)
+            port_wtd_div = res_df["Wtd Div %"].sum()
+
+            # ── Metrics ───────────────────────────────────────────────────
             ca, cb, cc, cd = st.columns(4)
             ca.metric("Return (with div)",   f"{exp_div_cp * 100:.2f}%")
             cb.metric("Return (price only)", f"{exp_po_cp  * 100:.2f}%")
             cc.metric("Annual Std Dev",      f"{ann_std_cp * 100:.2f}%")
-            cd.metric("Sharpe", f"{sharpe_cp:.2f}" if not np.isnan(sharpe_cp) else "N/A")
+            cd.metric("Sharpe (with div)",   f"{sharpe_cp:.2f}" if not np.isnan(sharpe_cp) else "N/A")
+
+            col_t, col_p = st.columns(2)
+
+            # ── Per-ticker table ───────────────────────────────────────────
+            with col_t:
+                st.subheader("Holdings")
+                st.dataframe(res_df, use_container_width=True)
+                st.metric("Portfolio Wtd Div Yield", f"{port_wtd_div:.2f}%")
+
+            # ── Pie chart ──────────────────────────────────────────────────
+            with col_p:
+                st.subheader("Allocation")
+                fig_pie = go.Figure(go.Pie(
+                    labels=[cp_names[t] for t in cp],
+                    values=[cp[t] * 100 for t in cp],
+                    hole=0.35,
+                    textinfo="label+percent",
+                ))
+                fig_pie.update_layout(showlegend=False, margin=dict(t=20, b=20))
+                st.plotly_chart(fig_pie, use_container_width=True)
