@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat)",
+      "Bash(python /tmp/parse_notebook_detailed.py)",
+      "Bash(git --version)",
+      "Bash(gh auth:*)"
+    ]
+  }
+}
